@@ -38,12 +38,16 @@ use X11::Xlib;
 use Carp qw(carp croak);
 use XSLoader;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 use constant DOM_TYPE_ELEMENT => 1;
 use constant ORDERED_NODE_SNAPSHOT_TYPE => 7;
 
 XSLoader::load(__PACKAGE__, $VERSION);
+
+=head2 PROPERTIES
+
+=cut
 
 has xvfb => (
     is  => 'ro',
@@ -51,28 +55,54 @@ has xvfb => (
 );
 
 has view => (
-    is      => 'ro',
-    isa     => 'Gtk3::WebKit::WebView',
-    lazy    => 1,
-    default => sub {
+    is        => 'ro',
+    isa       => 'Gtk3::WebKit::WebView',
+    lazy      => 1,
+    clearer   => 'clear_view',
+    predicate => 'has_view',
+    default   => sub {
         Gtk3::WebKit::WebView->new
     },
 );
 
+has scrolled_view => (
+    is        => 'ro',
+    isa       => 'Gtk3::ScrolledWindow',
+    lazy      => 1,
+    clearer   => 'clear_scrolled_view',
+    predicate => 'has_scrolled_view',
+    default   => sub {
+        Gtk3::ScrolledWindow->new;
+    }
+);
+
 has window => (
-    is      => 'ro',
-    isa     => 'Gtk3::Window',
-    lazy    => 1,
-    default => sub {
+    is        => 'ro',
+    isa       => 'Gtk3::Window',
+    lazy      => 1,
+    clearer   => 'clear_window',
+    predicate => 'has_window',
+    default   => sub {
         my ($self) = @_;
-        my $sw = Gtk3::ScrolledWindow->new;
+        my $sw = $self->scrolled_view;
         $sw->add($self->view);
 
         my $win = Gtk3::Window->new;
+        $win->set_title($self->window_title);
         $win->set_default_size(1600, 1200);
         $win->add($sw);
+
         return $win;
     }
+);
+
+has window_title => (
+    is      => 'ro',
+    isa     => 'Str',
+    lazy    => 1,
+    default => sub {
+        return 'www_webkit_window_' . int(rand() * 100000);
+    },
 );
 
 has alerts => (
@@ -92,6 +122,39 @@ has prompt_answers => (
     isa     => 'ArrayRef',
     default => sub { [] },
 );
+
+has display => (
+    is        => 'ro',
+    isa       => 'X11::Xlib',
+    lazy      => 1,
+    clearer   => 'clear_display',
+    predicate => 'has_display',
+    default   => sub {
+        my $display = X11::Xlib->new;
+        return $display;
+    },
+);
+
+has event_send_delay => (
+    is  => 'rw',
+    isa => 'Int',
+    default => 5, # ms
+);
+
+=head3 console_messages
+
+WWW::WebKit saves console messages in this array but still lets the default console handler handle the message.
+I'm not sure if this is the best way to go but you should be able to override this easily:
+
+    use Glib qw(TRUE FALSE);
+    $webkit->view->signal_connect('console-message' => sub {
+        push @{ $webkit->console_messages }, $_[1];
+        return TRUE;
+    });
+
+The TRUE return value prevents any further handlers from kicking in which in turn should prevent any messages from getting printed.
+
+=cut
 
 has console_messages => (
     is      => 'rw',
@@ -126,6 +189,8 @@ has modifiers => (
     default => sub { {control => 0} },
 );
 
+=head2 METHODS
+
 =head3 init
 
 Initializes Webkit and GTK3. Must be called before any of the other methods.
@@ -136,6 +201,12 @@ sub init {
     my ($self) = @_;
 
     $self->setup_xvfb if $self->xvfb;
+
+    return $self->init_webkit;
+}
+
+sub init_webkit {
+    my ($self) = @_;
 
     Gtk3::init;
 
@@ -195,11 +266,40 @@ sub setup_xvfb {
     $ENV{DISPLAY} = ":$display";
 }
 
+sub uninit {
+    my ($self) = @_;
+
+    if ($self->has_view) {
+        $self->scrolled_view->remove($self->view) if $self->has_scrolled_view and $self->scrolled_view and $self->view;
+        $self->view->destroy if $self->view;
+        $self->clear_view;
+    }
+
+    if ($self->has_scrolled_view) {
+        $self->window->remove($self->scrolled_view) if $self->has_window and $self->window and $self->scrolled_view;
+        $self->scrolled_view->destroy if $self->scrolled_view;
+        $self->clear_scrolled_view;
+    }
+
+    if ($self->has_window) {
+        $self->window->destroy if $self->window;
+        $self->clear_window;
+    }
+
+    $self->clear_display;
+
+    if ($self->xvfb_pid) {
+        local $SIG{PIPE} = "IGNORE";
+        kill 15, $self->xvfb_pid;
+        close $self->xvfb_server;
+        $self->xvfb_pid(0);
+    }
+}
+
 sub DESTROY {
     my ($self) = @_;
-    return unless $self->xvfb_pid;
 
-    kill 15, $self->xvfb_pid;
+    $self->uninit;
 }
 
 =head2 Implemented methods of the Selenium API
@@ -302,10 +402,16 @@ sub resolve_locator {
         return $document->get_element_by_id($id);
     }
     elsif (my ($css) = $locator =~ /^css=(.*)/) {
-        return $document->query_selector($css);
+        my $elements = $document->query_selector_all($css);
+        my $length = $elements->get_length;
+        croak "$css gave $length results" if $length != 1;
+        return $elements->item(0);
     }
     elsif (my ($class) = $locator =~ /^class=(.*)/) {
-        return $document->query_selector(".$class");
+        my $elements = $document->query_selector_all(".$class");
+        my $length = $elements->get_length;
+        croak ".$class gave $length results" if $length != 1;
+        return $elements->item(0);
     }
     elsif (my ($name) = $locator =~ /^name=(.*)/) {
         return $self->resolve_locator(qq{xpath=.//*[\@name="$name"]}, $document, $context);
@@ -379,6 +485,8 @@ sub click {
     my ($x, $y) = $self->get_center_screen_position($target);
     $click->init_mouse_event('click', TRUE, TRUE, $document->get_property('default_view'), 1, $x, $y, $x, $y, FALSE, FALSE, FALSE, FALSE, 0, $target);
     $target->dispatch_event($click);
+
+    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
     return 1;
 }
 
@@ -435,9 +543,9 @@ sub change_check {
 sub wait_for_page_to_load {
     my ($self, $timeout) = @_;
 
-    #TODO implement timeout
-    $self->pause(300);
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    return $self->wait_for_condition(sub {
+        $self->view->get_load_status eq 'finished';
+    }, $timeout);
 }
 
 =head3 wait_for_element_present($locator, $timeout)
@@ -446,20 +554,10 @@ sub wait_for_page_to_load {
 
 sub wait_for_element_present {
     my ($self, $locator, $timeout) = @_;
-    $timeout ||= $self->default_timeout;
 
-    my $element;
-    my $expiry = time + $timeout / 1000;
-
-    while (1) {
-        Gtk3->main_iteration while Gtk3->events_pending;
-
-        last if $element = $self->is_element_present($locator);
-        last if time > $expiry;
-        usleep 10000;
-    }
-
-    return $element;
+    return $self->wait_for_condition(sub {
+        $self->is_element_present($locator)
+    }, $timeout);
 }
 
 =head3 is_element_present($locator)
@@ -495,6 +593,8 @@ sub type {
 
     $self->resolve_locator($locator)->set_value($text);
 
+    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+
     return 1;
 }
 
@@ -515,6 +615,8 @@ sub key_press {
     $display->XTestFakeKeyEvent($keycode, 1, 1);
     $display->XTestFakeKeyEvent($keycode, 0, 1);
     $display->XFlush;
+
+    usleep 50000; # time for the X server to deliver the event
 
     # Unfortunately just does nothing:
     #Gtk3::test_widget_send_key($self->view, int($key), 'GDK_MODIFIER_MASK');
@@ -608,15 +710,7 @@ sub get_title {
 
 sub mouse_over {
     my ($self, $locator) = @_;
-
-    my $document = $self->view->get_dom_document;
-    my $target = $self->resolve_locator($locator, $document) or return;
-
-    my $move = $document->create_event('MouseEvent');
-    $move->init_mouse_event('mouseover', TRUE, TRUE, $document->get_property('default_view'), 1, 0, 0, 0, 0, FALSE, FALSE, FALSE, FALSE, 0, $target);
-    $target->dispatch_event($move);
-
-    return 1;
+    return $self->fire_mouse_event($locator, 'mouseover');
 }
 
 =head3 mouse_down($locator)
@@ -625,13 +719,33 @@ sub mouse_over {
 
 sub mouse_down {
     my ($self, $locator) = @_;
+    return $self->fire_mouse_event($locator, 'mousedown');
+}
+
+=head3 mouse_up($locator)
+
+=cut
+
+sub mouse_up {
+    my ($self, $locator) = @_;
+    return $self->fire_mouse_event($locator, 'mouseup');
+}
+
+=head3 fire_mouse_event($locator, $event_type)
+
+=cut
+
+sub fire_mouse_event {
+    my ($self, $locator, $event_type) = @_;
 
     my $document = $self->view->get_dom_document;
     my $target = $self->resolve_locator($locator, $document) or return;
 
-    my $click = $document->create_event('MouseEvent');
-    $click->init_mouse_event('mousedown', TRUE, TRUE, $document->get_property('default_view'), 1, 0, 0, 0, 0, $self->modifiers->{control} ? TRUE : FALSE, FALSE, FALSE, FALSE, 0, $target);
-    $target->dispatch_event($click);
+    my $event = $document->create_event('MouseEvent');
+    $event->init_mouse_event($event_type, TRUE, TRUE, $document->get_property('default_view'), 1, 0, 0, 0, 0, $self->modifiers->{control} ? TRUE : FALSE, FALSE, FALSE, FALSE, 0, $target);
+    $target->dispatch_event($event);
+
+    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
     return 1;
 }
 
@@ -715,6 +829,8 @@ sub submit {
     my $form = $self->resolve_locator($locator) or return;
     $form->submit;
 
+    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+
     return 1;
 }
 
@@ -770,19 +886,10 @@ Works just like wait_for_element_present but instead of waiting for the element 
 
 sub wait_for_element_to_disappear {
     my ($self, $locator, $timeout) = @_;
-    $timeout ||= $self->default_timeout;
 
-    my $element;
-    my $expiry = time + $timeout / 1000;
-
-    while ($element = $self->is_element_present($locator)) {
-        Gtk3->main_iteration while Gtk3->events_pending;
-
-        return 0 if time > $expiry;
-        usleep 10000;
-    }
-
-    return 1;
+    return $self->wait_for_condition(sub {
+        not $self->is_element_present($locator)
+    }, $timeout);
 }
 
 =head3 wait_for_alert($text, $timeout)
@@ -798,68 +905,160 @@ If $text is undef, it waits for any alert. Since alerts do not get automatically
 
 sub wait_for_alert {
     my ($self, $text, $timeout) = @_;
+
+    return $self->wait_for_condition(sub {
+        defined $text ? (@{ $self->alerts } and $self->alerts->[-1] eq $text) : @{ $self->alerts };
+    }, $timeout);
+}
+
+=head3 wait_for_condition($condition, $timeout)
+
+Wait for the given $condition sub to return a true value or $timeout to expire.
+Returns the return value of $condition or 0 on timeout.
+
+    $webkit->wait_for_condition(sub {
+        $webkit->is_visible('id=foo');
+    }, 10000);
+
+=cut
+
+sub wait_for_condition {
+    my ($self, $condition, $timeout) = @_;
+
     $timeout ||= $self->default_timeout;
 
     my $expiry = time + $timeout / 1000;
 
-    until (defined $text ? (@{ $self->alerts } and $self->alerts->[-1] eq $text) : @{ $self->alerts }) {
+    my $result;
+    until ($result = $condition->()) {
         Gtk3->main_iteration while Gtk3->events_pending;
 
         return 0 if time > $expiry;
         usleep 10000;
     }
 
-    return 1;
+    return $result;
 }
 
-=head3 native_drag_and_drop_to_object($source, $target)
+=head3 native_drag_and_drop_to_position($source, $target_x, $target_y, $options)
 
-Drag&drop that works with native HTML5 D&D events.
+Drag and drop $source to position ($target_x and $target_y).
 
 =cut
 
-sub native_drag_and_drop_to_object {
-    my ($self, $source, $target) = @_;
+sub native_drag_and_drop_to_position {
+    my ($self, $source, $target_x, $target_y, $options) = @_;
+
+    my $steps = $options->{steps} // 5;
+    my $step_delay =  $options->{step_delay} // 150; # ms
+    $self->event_send_delay($options->{event_send_delay}) if $options->{event_send_delay};
 
     $source = $self->resolve_locator($source);
     my ($source_x, $source_y) = $self->get_center_screen_position($source);
 
-    $target = $self->resolve_locator($target);
-    my ($target_x, $target_y) = $self->get_center_screen_position($target);
+    my ($delta_x, $delta_y) = ($target_x - $source_x, $target_y - $source_y);
+    my ($step_x, $step_y) = (int($delta_x / $steps), int($delta_y / $steps));
+    my ($x, $y) = ($source_x, $source_y);
 
-    my $display = X11::Xlib->new;
-    $display->XTestFakeMotionEvent(0, $source_x, $source_y, 5);
-    $display->XFlush;
-    $self->pause(50); # Time for DnD to kick in
-    $display->XTestFakeButtonEvent(1, 1, 0);
-    $display->XFlush;
-    $self->pause(50);
-    $display->XTestFakeMotionEvent(0, $source_x, $source_y - 1, 5);
-    $display->XFlush;
-    $self->pause(50);
-    $display->XTestFakeMotionEvent(0, $target_x, $target_y + 1, 5);
-    $display->XFlush;
-    $self->pause(50);
-    $display->XTestFakeMotionEvent(0, $target_x, $target_y, 5);
-    $display->XFlush;
-    $self->pause(50);
-    $display->XTestFakeButtonEvent(1, 0, 5);
-    $display->XFlush;
-    # Mouse cursor jumps to 0,0 for no apparrent reason. Move it back to the target
-    $self->pause(50);
-    $display->XTestFakeMotionEvent(0, $target_x, $target_y + 1, 5);
-    $display->XFlush;
-    $self->pause(50);
-    $display->XTestFakeMotionEvent(0, $target_x, $target_y, 5);
-    $display->XFlush;
-    $self->pause(50);
+    $self->move_mouse_abs($source_x, $source_y);
+    $self->pause($step_delay);
+    $self->press_mouse_button(1);
+    $self->pause($step_delay);
+
+    foreach (1..$steps) {
+        $self->move_mouse_abs($x += $step_x, $y += $step_y);
+        $self->pause($step_delay);
+    }
+
+    $self->move_mouse_abs($target_x, $target_y);
+    $self->pause($step_delay);
+    $self->release_mouse_button(1);
+    $self->pause($step_delay);
+    $self->move_mouse_abs($target_x, $target_y);
+    $self->pause($step_delay);
+
+    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+}
+
+=head3 native_drag_and_drop_to_object($source, $target, $options)
+
+Drag and drop $source to $target.
+
+=cut
+
+sub native_drag_and_drop_to_object {
+    my ($self, $source_locator, $target_locator, $options) = @_;
+
+    my $target = $self->resolve_locator($target_locator)
+        or croak "did not find element $target_locator";
+
+    my $steps = $options->{steps} // 5;
+    my $step_delay =  $options->{step_delay} // 150; # ms
+    $self->event_send_delay($options->{event_send_delay}) if $options->{event_send_delay};
+
+    my $source = $self->resolve_locator($source_locator)
+        or croak "did not find element $source_locator";
+    my ($x, $y) = $self->get_center_screen_position($source);
+
+    $self->pause($step_delay);
+    $self->move_mouse_abs($x, $y);
+    $self->pause($step_delay);
+    $self->press_mouse_button(1);
+    $self->pause($step_delay);
+
+    foreach (0 .. $steps - 1) {
+        my ($target_x, $target_y) = $self->get_center_screen_position($target);
+
+        my $delta_x = $target_x - $x;
+        my $delta_y = $target_y - $y;
+        my $step_x = int($delta_x / ($steps - $_));
+        my $step_y = int($delta_y / ($steps - $_));
+
+
+        $self->move_mouse_abs($x += $step_x, $y += $step_y);
+        $self->pause($step_delay);
+    }
+
+    # "move" mouse again to cause a dragover event on the target
+    # otherwise a drop may not work
+    $self->move_mouse_abs($x, $y);
+    $self->pause($step_delay);
+
+    $self->release_mouse_button(1);
+    $self->pause($step_delay);
+    $self->move_mouse_abs($x, $y);
+    $self->pause($step_delay);
+
+    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+}
+
+sub move_mouse_abs {
+    my ($self, $x, $y) = @_;
+
+    $self->display->XTestFakeMotionEvent(0, $x, $y, $self->event_send_delay);
+    $self->display->XFlush;
+}
+
+sub press_mouse_button {
+    my ($self, $button) = @_;
+
+    $self->display->XTestFakeButtonEvent($button, 1, $self->event_send_delay);
+    $self->display->XFlush;
+}
+
+sub release_mouse_button {
+    my ($self, $button) = @_;
+
+    $self->display->XTestFakeButtonEvent($button, 0, $self->event_send_delay);
+    $self->display->XFlush;
 }
 
 sub get_screen_position {
     my ($self, $element) = @_;
 
-    my $x = 0;
-    my $y = 0;
+    croak 'did not get an element to get the position from' unless $element;
+
+    my ($x, $y) = $self->scrolled_view->get_window->get_position;
 
     do {
         $x += $element->get_offset_left;
@@ -886,6 +1085,9 @@ sub get_center_screen_position {
 See L<WWW::Selenium> for API documentation.
 See L<Test::WWW::WebKit> for a replacement for L<Test::WWW::Selenium>.
 See L<Test::WWW::WebKit::Catalyst> for a replacement for L<Test::WWW::Selenium::Catalyst>.
+
+The current development version can be found in the git repository at:
+https://github.com/niner/WWW-WebKit
 
 =head1 AUTHOR
 
