@@ -38,7 +38,7 @@ use X11::Xlib;
 use Carp qw(carp croak);
 use XSLoader;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use constant DOM_TYPE_ELEMENT => 1;
 use constant ORDERED_NODE_SNAPSHOT_TYPE => 7;
@@ -223,7 +223,7 @@ sub init_webkit {
         # warn 'prompt: ' . $_[2];
         # warn "answering with: " . $self->prompt_answers->[-1];
         #FIXME causes segfault:
-        #WWW::WebKit::XSHelper::set_string_return_value($_[4], pop @{ $self->prompt_answers });
+        # WWW::WebKit::XSHelper::set_string_return_value($_[4], pop @{ $self->prompt_answers });
         return TRUE;
     });
     $self->view->signal_connect('console-message' => sub {
