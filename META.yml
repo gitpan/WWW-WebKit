@@ -12,7 +12,7 @@ configure_requires:
   ExtUtils::PkgConfig: 0
   Glib::MakeHelper: 0
 dynamic_config: 1
-generated_by: 'ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120630'
+generated_by: 'ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120921'
 license: perl
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html
@@ -30,4 +30,4 @@ requires:
   Moose: 0
   Time::HiRes: 0
   X11::Xlib: 0
-version: 0.05
+version: 0.06

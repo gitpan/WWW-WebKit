@@ -37,8 +37,10 @@ use Time::HiRes qw(time usleep);
 use X11::Xlib;
 use Carp qw(carp croak);
 use XSLoader;
+use English '-no_match_vars';
+use POSIX qw<F_SETFD F_GETFD FD_CLOEXEC>;
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 use constant DOM_TYPE_ELEMENT => 1;
 use constant ORDERED_NODE_SNAPSHOT_TYPE => 7;
@@ -174,19 +176,16 @@ has default_timeout => (
     default => 30_000,
 );
 
-has xvfb_pid => (
-    is  => 'rw',
-    isa => 'Int',
-);
-
-has xvfb_server => (
-    is => 'rw',
-);
-
 has modifiers => (
     is      => 'ro',
     isa     => 'HashRef',
     default => sub { {control => 0} },
+);
+
+has pending => (
+    is      => 'rw',
+    isa     => 'Int',
+    default => 0,
 );
 
 =head2 METHODS
@@ -208,6 +207,8 @@ sub init {
 sub init_webkit {
     my ($self) = @_;
 
+    # connect to X server to keep it alive till we don't need it anymore
+    $self->display;
     Gtk3::init;
 
     $self->view->signal_connect('script-alert' => sub {
@@ -235,15 +236,30 @@ sub init_webkit {
         return TRUE;
     });
 
+    $self->view->signal_connect('resource-request-starting' => sub {
+        return $self->handle_resource_request(@_);
+    });
+
     $self->window->show_all;
-    Gtk3->main_iteration while Gtk3->events_pending;
+    Gtk3::main_iteration while Gtk3::events_pending;
 
     return $self;
+}
+
+sub handle_resource_request {
+    my ($self, $view, $frame, $resource, $request, $response, $data) = @_;
+
+    $self->pending($self->pending + 1);
+
+    $resource->signal_connect('response-received' => sub {
+        $self->pending($self->pending - 1);
+    });
 }
 
 sub setup_xvfb {
     my ($self) = @_;
 
+    # close STDERR to avoid Xvfb's noise
     open my $stderr, '>&', \*STDERR or die "Can't dup STDERR: $!";
     close STDERR;
 
@@ -252,18 +268,31 @@ sub setup_xvfb {
         die 'Could not start Xvfb';
     }
 
-    my ($server, $display);
-    while (1) {
-        $display = 1 + int(rand(98));
+    # restore STDERR
+    open STDERR, '>&', $stderr;
 
-        last if $self->xvfb_pid(open $server, '|-', "Xvfb :$display -screen 0 1600x1200x24");
-    }
+    pipe my $read, my $write;
+    my $writefd = fileno $write;
+
+    # prevent pipe FD from being closed on exec when starting Xvfb:
+    $SYSTEM_FD_MAX = $writefd;
+    my $flags = fcntl $write, F_GETFD, 0;
+    $flags &= ~FD_CLOEXEC;
+    fcntl $write, F_SETFD, $flags;
+
+    open STDERR, '>/dev/null';
+
+    system ("Xvfb -nolisten tcp -terminate -screen 0 1600x1200x24 -displayfd $writefd &");
 
     open STDERR, '>&', $stderr;
 
-    sleep 1;
-    $self->xvfb_server($server);
+    # Xvfb prints the display number newline terminated to our pipe
+    my $display = <$read>;
+    chomp $display;
+
     $ENV{DISPLAY} = ":$display";
+
+    return;
 }
 
 sub uninit {
@@ -287,13 +316,6 @@ sub uninit {
     }
 
     $self->clear_display;
-
-    if ($self->xvfb_pid) {
-        local $SIG{PIPE} = "IGNORE";
-        kill 15, $self->xvfb_pid;
-        close $self->xvfb_server;
-        $self->xvfb_pid(0);
-    }
 }
 
 sub DESTROY {
@@ -327,7 +349,7 @@ sub open {
 
     $self->view->open($url);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 }
 
 =head3 refresh()
@@ -338,7 +360,7 @@ sub refresh {
     my ($self) = @_;
 
     $self->view->reload;
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 }
 
 =head3 go_back()
@@ -349,7 +371,7 @@ sub go_back {
     my ($self) = @_;
 
     $self->view->go_back;
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 }
 
 sub eval_js {
@@ -357,7 +379,7 @@ sub eval_js {
 
     $js =~ s/'/\\'/g;
     $self->view->execute_script("alert(eval('$js'));");
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
     return pop @{ $self->alerts };
 }
 
@@ -418,7 +440,7 @@ sub resolve_locator {
     }
     elsif (my ($xpath) = $locator =~ /^(?: xpath=)?(.*)/xm) {
         my $resolver = $document->create_ns_resolver($context);
-        my $xpath_results = $document->evaluate($xpath, $context, $resolver, ORDERED_NODE_SNAPSHOT_TYPE, undef);
+        my $xpath_results = $document->evaluate($xpath, $context, $resolver, ORDERED_NODE_SNAPSHOT_TYPE, Gtk3::WebKit::DOMXPathResult->new);
         my $length = $xpath_results->get_snapshot_length;
         croak "$xpath gave $length results: " . join(', ', map $xpath_results->snapshot_item($_), 0 .. $length - 1) if $length != 1;
         return $xpath_results->snapshot_item(0);
@@ -437,7 +459,7 @@ sub get_xpath_count {
 
     my $document = $self->view->get_dom_document;
     my $resolver = $document->create_ns_resolver($document);
-    my $xpath_results = $document->evaluate($xpath, $document, $resolver, ORDERED_NODE_SNAPSHOT_TYPE, undef);
+    my $xpath_results = $document->evaluate($xpath, $document, $resolver, ORDERED_NODE_SNAPSHOT_TYPE, Gtk3::WebKit::DOMXPathResult->new);
     return $xpath_results->get_snapshot_length;
 }
 
@@ -463,7 +485,7 @@ sub select {
             $changed->init_event('change', TRUE, TRUE);
             $select->dispatch_event($changed);
 
-            Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+            Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
             return 1;
         }
     }
@@ -486,7 +508,7 @@ sub click {
     $click->init_mouse_event('click', TRUE, TRUE, $document->get_property('default_view'), 1, $x, $y, $x, $y, FALSE, FALSE, FALSE, FALSE, 0, $target);
     $target->dispatch_event($click);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
     return 1;
 }
 
@@ -532,7 +554,7 @@ sub change_check {
     $changed->init_event('change', TRUE, TRUE);
     $element->dispatch_event($changed);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
     return 1;
 }
 
@@ -593,7 +615,7 @@ sub type {
 
     $self->resolve_locator($locator)->set_value($text);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 
     return 1;
 }
@@ -601,6 +623,10 @@ sub type {
 my %keycodes = (
     '\013' => 36,
     '\027' => 9,
+    '\032' => 65,
+    '\127' => 119,
+    '\045' => 20,
+    '\046' => 60,
 );
 
 sub key_press {
@@ -621,7 +647,7 @@ sub key_press {
     # Unfortunately just does nothing:
     #Gtk3::test_widget_send_key($self->view, int($key), 'GDK_MODIFIER_MASK');
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 
     return 1;
 }
@@ -664,7 +690,7 @@ sub pause {
     my $expiry = time + $time / 1000;
 
     while (1) {
-        Gtk3->main_iteration while Gtk3->events_pending;
+        Gtk3::main_iteration while Gtk3::events_pending;
 
         if (time < $expiry) {
             usleep 10000;
@@ -745,7 +771,7 @@ sub fire_mouse_event {
     $event->init_mouse_event($event_type, TRUE, TRUE, $document->get_property('default_view'), 1, 0, 0, 0, 0, $self->modifiers->{control} ? TRUE : FALSE, FALSE, FALSE, FALSE, 0, $target);
     $target->dispatch_event($event);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
     return 1;
 }
 
@@ -814,7 +840,7 @@ sub is_visible {
     do {
         $style = $view->get_computed_style($element, '');
         $visible &&= $style->get_property_value('display') eq 'none' ? 0 : 1;
-    } while ($visible and $element = $element->get_parent_node);
+    } while ($visible and $element = $element->get_parent_node and $element->get_node_type == 1);
 
     return $visible;
 }
@@ -829,12 +855,18 @@ sub submit {
     my $form = $self->resolve_locator($locator) or return;
     $form->submit;
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 
     return 1;
 }
 
 =head3 get_html_source()
+
+Returns the source code of the current HTML page as it was transferred over the network.
+
+Use $webkit->view->get_dom_document->get_document_element->get_outer_html to get the serialized
+current DOM tree (with all modifications by Javascript)
+
 
 =cut
 
@@ -877,6 +909,21 @@ sub answer_on_next_prompt {
 }
 
 =head2 Additions to the Selenium API
+
+=head3 wait_for_pending_requests($timeout)
+
+Waits for all pending requests to finish. This is most useful for AJAX applications,
+since wait_for_page_to_load does not wait for AJAX requests.
+
+=cut
+
+sub wait_for_pending_requests {
+    my ($self, $timeout) = @_;
+
+    return $self->wait_for_condition(sub {
+        $self->pending == 0;
+    }, $timeout);
+}
 
 =head3 wait_for_element_to_disappear($locator, $timeout)
 
@@ -931,7 +978,7 @@ sub wait_for_condition {
 
     my $result;
     until ($result = $condition->()) {
-        Gtk3->main_iteration while Gtk3->events_pending;
+        Gtk3::main_iteration while Gtk3::events_pending;
 
         return 0 if time > $expiry;
         usleep 10000;
@@ -977,7 +1024,7 @@ sub native_drag_and_drop_to_position {
     $self->move_mouse_abs($target_x, $target_y);
     $self->pause($step_delay);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 }
 
 =head3 native_drag_and_drop_to_object($source, $target, $options)
@@ -1029,7 +1076,7 @@ sub native_drag_and_drop_to_object {
     $self->move_mouse_abs($x, $y);
     $self->pause($step_delay);
 
-    Gtk3->main_iteration while Gtk3->events_pending or $self->view->get_load_status ne 'finished';
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 }
 
 sub move_mouse_abs {
