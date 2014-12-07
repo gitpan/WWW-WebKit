@@ -3,31 +3,30 @@ abstract: 'Perl extension for controlling an embedding WebKit engine'
 author:
   - 'Stefan Seifert <nine@cpan.org>'
 build_requires:
-  ExtUtils::MakeMaker: 0
-  Test::More: 0.88
-  URI: 0
+  Test::More: '0.88'
+  URI: '0'
 configure_requires:
-  ExtUtils::Depends: 0
-  ExtUtils::MakeMaker: 0
-  ExtUtils::PkgConfig: 0
-  Glib::MakeHelper: 0
+  ExtUtils::Depends: '0'
+  ExtUtils::MakeMaker: '0'
+  ExtUtils::PkgConfig: '0'
+  Glib::MakeHelper: '0'
 dynamic_config: 1
-generated_by: 'ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120921'
+generated_by: 'ExtUtils::MakeMaker version 6.98, CPAN::Meta::Converter version 2.142690'
 license: perl
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html
-  version: 1.4
+  version: '1.4'
 name: WWW-WebKit
 no_index:
   directory:
     - t
     - inc
 requires:
-  Carp: 0
-  Glib: 0
-  Gtk3: 0
-  Gtk3::WebKit: 0.02
-  Moose: 0
-  Time::HiRes: 0
-  X11::Xlib: 0
-version: 0.06
+  Carp: '0'
+  Glib: '0'
+  Gtk3: '0'
+  Gtk3::WebKit: '0.02'
+  Moose: '0'
+  Time::HiRes: '0'
+  X11::Xlib: '0'
+version: '0.07'

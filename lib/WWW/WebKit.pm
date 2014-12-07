@@ -40,7 +40,7 @@ use XSLoader;
 use English '-no_match_vars';
 use POSIX qw<F_SETFD F_GETFD FD_CLOEXEC>;
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 use constant DOM_TYPE_ELEMENT => 1;
 use constant ORDERED_NODE_SNAPSHOT_TYPE => 7;
@@ -179,13 +179,13 @@ has default_timeout => (
 has modifiers => (
     is      => 'ro',
     isa     => 'HashRef',
-    default => sub { {control => 0} },
+    default => sub { {control => 0, 'shift' => 0} },
 );
 
-has pending => (
+has pending_requests => (
     is      => 'rw',
-    isa     => 'Int',
-    default => 0,
+    isa     => 'HashRef',
+    default => sub { {} },
 );
 
 =head2 METHODS
@@ -241,18 +241,39 @@ sub init_webkit {
     });
 
     $self->window->show_all;
-    Gtk3::main_iteration while Gtk3::events_pending;
+    $self->process_events;
 
     return $self;
+}
+
+sub pending {
+    my ($self) = @_;
+
+    return scalar keys %{ $self->pending_requests };
+}
+
+sub process_events {
+    my ($self) = @_;
+    Gtk3::main_iteration while Gtk3::events_pending;
+}
+
+sub process_page_load {
+    my ($self) = @_;
+    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
 }
 
 sub handle_resource_request {
     my ($self, $view, $frame, $resource, $request, $response, $data) = @_;
 
-    $self->pending($self->pending + 1);
+    $self->pending_requests->{"$request"}++;
 
     $resource->signal_connect('response-received' => sub {
-        $self->pending($self->pending - 1);
+        delete $self->pending_requests->{"$request"};
+    });
+    $resource->signal_connect('load-failed' => sub {
+        # If someone decides not to wait_for_pending_requests, this signal is received
+        # during global destruction with $self beeing undefined.
+        delete $self->pending_requests->{"$request"} if defined $self;
     });
 }
 
@@ -349,7 +370,7 @@ sub open {
 
     $self->view->open($url);
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 }
 
 =head3 refresh()
@@ -360,7 +381,7 @@ sub refresh {
     my ($self) = @_;
 
     $self->view->reload;
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 }
 
 =head3 go_back()
@@ -371,15 +392,16 @@ sub go_back {
     my ($self) = @_;
 
     $self->view->go_back;
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 }
 
 sub eval_js {
     my ($self, $js) = @_;
 
     $js =~ s/'/\\'/g;
+    $js =~ s/(?<!\\)\n/\\\n/g;
     $self->view->execute_script("alert(eval('$js'));");
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
     return pop @{ $self->alerts };
 }
 
@@ -485,7 +507,7 @@ sub select {
             $changed->init_event('change', TRUE, TRUE);
             $select->dispatch_event($changed);
 
-            Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+            $self->process_page_load;
             return 1;
         }
     }
@@ -499,17 +521,7 @@ sub select {
 
 sub click {
     my ($self, $locator) = @_;
-
-    my $document = $self->view->get_dom_document;
-    my $target = $self->resolve_locator($locator, $document) or return;
-
-    my $click = $document->create_event('MouseEvent');
-    my ($x, $y) = $self->get_center_screen_position($target);
-    $click->init_mouse_event('click', TRUE, TRUE, $document->get_property('default_view'), 1, $x, $y, $x, $y, FALSE, FALSE, FALSE, FALSE, 0, $target);
-    $target->dispatch_event($click);
-
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
-    return 1;
+    return $self->fire_mouse_event($locator, 'click');
 }
 
 =head3 check($locator)
@@ -554,7 +566,7 @@ sub change_check {
     $changed->init_event('change', TRUE, TRUE);
     $element->dispatch_event($changed);
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
     return 1;
 }
 
@@ -615,18 +627,25 @@ sub type {
 
     $self->resolve_locator($locator)->set_value($text);
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 
     return 1;
 }
 
 my %keycodes = (
-    '\013' => 36,
-    '\027' => 9,
-    '\032' => 65,
-    '\127' => 119,
-    '\045' => 20,
-    '\046' => 60,
+    '\013' => 36,  # Carriage Return
+    "\n"   => 36,  # Carriage Return
+    '\027' => 9,   # Escape
+    ' '    => 65,  # Space
+    '\032' => 65,  # Space
+    '\127' => 119, # Delete
+    '\8'   => 22,  # Backspace
+    '\044' => 59,  # Comma
+    ','    => 59,  # Comma
+    '\045' => 20,  # Hyphen
+    '-'    => 20,  # Hyphen
+    '\046' => 60,  # Dot
+    '.'    => 60,  # Dot
 );
 
 sub key_press {
@@ -638,8 +657,11 @@ sub key_press {
     $elem ||= $self->resolve_locator($locator) or return;
     $elem->focus;
 
+    my $shift_keycode = 62;
+    $display->XTestFakeKeyEvent($shift_keycode, 1, 1) if $self->modifiers->{'shift'};
     $display->XTestFakeKeyEvent($keycode, 1, 1);
     $display->XTestFakeKeyEvent($keycode, 0, 1);
+    $display->XTestFakeKeyEvent($shift_keycode, 0, 1) if $self->modifiers->{'shift'};
     $display->XFlush;
 
     usleep 50000; # time for the X server to deliver the event
@@ -647,7 +669,7 @@ sub key_press {
     # Unfortunately just does nothing:
     #Gtk3::test_widget_send_key($self->view, int($key), 'GDK_MODIFIER_MASK');
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 
     return 1;
 }
@@ -662,10 +684,36 @@ sub type_keys {
     my $element = $self->resolve_locator($locator) or return;
 
     foreach (split //, $string) {
+        $self->shift_key_down if $self->is_upper_case($_);
         $self->key_press($locator, $_, $element) or return;
+        $self->shift_key_up if $self->is_upper_case($_);
     }
 
     return 1;
+}
+
+=head3 delete_text($locator)
+
+Delete text in elements where contenteditable="true".
+
+=cut
+
+sub delete_text {
+    my ($self, $locator) = @_;
+
+    my $element = $self->resolve_locator($locator) or return;
+
+    while ($self->get_text($locator)) {
+        $self->key_press($locator, '\127', $element); # Delete
+    };
+
+    return 1;
+}
+
+sub is_upper_case {
+    my ($self, $char) = @_;
+
+    return $char =~ /[A-Z]/;
 }
 
 sub control_key_down {
@@ -680,6 +728,18 @@ sub control_key_up {
     $self->modifiers->{control} = 0;
 }
 
+sub shift_key_down {
+    my ($self) = @_;
+
+    $self->modifiers->{'shift'} = 1;
+}
+
+sub shift_key_up {
+    my ($self) = @_;
+
+    $self->modifiers->{'shift'} = 0;
+}
+
 =head3 pause($time)
 
 =cut
@@ -690,7 +750,7 @@ sub pause {
     my $expiry = time + $time / 1000;
 
     while (1) {
-        Gtk3::main_iteration while Gtk3::events_pending;
+        $self->process_events;
 
         if (time < $expiry) {
             usleep 10000;
@@ -768,10 +828,11 @@ sub fire_mouse_event {
     my $target = $self->resolve_locator($locator, $document) or return;
 
     my $event = $document->create_event('MouseEvent');
-    $event->init_mouse_event($event_type, TRUE, TRUE, $document->get_property('default_view'), 1, 0, 0, 0, 0, $self->modifiers->{control} ? TRUE : FALSE, FALSE, FALSE, FALSE, 0, $target);
+    my ($x, $y) = $self->get_center_screen_position($target);
+    $event->init_mouse_event($event_type, TRUE, TRUE, $document->get_property('default_view'), 1, $x, $y, $x, $y, $self->modifiers->{control} ? TRUE : FALSE, FALSE, FALSE, FALSE, 0, $target);
     $target->dispatch_event($event);
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
     return 1;
 }
 
@@ -801,7 +862,10 @@ sub get_value {
 
     my $element = $self->resolve_locator($locator);
 
-    if (lc $element->get_node_name eq 'input' and $element->get_property('type') ~~ [qw(checkbox radio)]) {
+    if (
+        lc $element->get_node_name eq 'input'
+        and $element->get_property('type') =~ /\A(checkbox|radio)\z/
+    ) {
         return $element->get_checked ? 'on' : 'off';
     }
     else {
@@ -855,7 +919,7 @@ sub submit {
     my $form = $self->resolve_locator($locator) or return;
     $form->submit;
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 
     return 1;
 }
@@ -978,7 +1042,7 @@ sub wait_for_condition {
 
     my $result;
     until ($result = $condition->()) {
-        Gtk3::main_iteration while Gtk3::events_pending;
+        $self->process_events;
 
         return 0 if time > $expiry;
         usleep 10000;
@@ -1024,7 +1088,7 @@ sub native_drag_and_drop_to_position {
     $self->move_mouse_abs($target_x, $target_y);
     $self->pause($step_delay);
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 }
 
 =head3 native_drag_and_drop_to_object($source, $target, $options)
@@ -1076,7 +1140,7 @@ sub native_drag_and_drop_to_object {
     $self->move_mouse_abs($x, $y);
     $self->pause($step_delay);
 
-    Gtk3::main_iteration while Gtk3::events_pending or $self->view->get_load_status ne 'finished';
+    $self->process_page_load;
 }
 
 sub move_mouse_abs {
@@ -1123,6 +1187,21 @@ sub get_center_screen_position {
     $y += $element->get_offset_height / 2;
 
     return ($x, $y);
+}
+
+=head3 disable_plugins()
+
+Disables WebKit plugins. Use this if you don't need plugins like Java and Flash
+and want to for example silence plugin loading messages.
+
+=cut
+
+sub disable_plugins {
+    my ($self) = @_;
+
+    my $settings = $self->view->get_settings;
+    $settings->set_property(enable_plugins => FALSE);
+    $self->view->set_settings($settings);
 }
 
 1;

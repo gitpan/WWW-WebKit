@@ -16,6 +16,10 @@ if ($@ and $@ =~ /\ACould not start Xvfb/) {
     $sel = WWW::WebKit->new();
     $sel->init;
 }
+elsif ($@) {
+    diag($@);
+    fail('init webkit');
+}
 ok(1, 'init done');
 
 $sel->open("$Bin/test/load.html");
@@ -27,7 +31,7 @@ $sel->open("$Bin/test/drag_and_drop.html");
 ok(1, 'opened');
 
 $sel->native_drag_and_drop_to_object('id=dragme', 'id=target');
-is($sel->resolve_locator('id=dragme')->get_parent_node->get_id, 'target');
+is($sel->resolve_locator('id=dragme')->get_parent_node->Gtk3::WebKit::DOMElement::get_id, 'target');
 
 $sel->refresh;
 
@@ -91,6 +95,28 @@ $sel->wait_for_condition(sub {
     URI->new($sel->view->get_uri)->query eq 'foo=bar'
 });
 
+$sel->open("$Bin/test/type.html");
+$sel->type_keys('id=foo', 'bar');
+$sel->click('id=submit');
+$sel->wait_for_condition(sub {
+    URI->new($sel->view->get_uri)->query eq 'foo=bar'
+});
+
+$sel->open("$Bin/test/type.html");
+$sel->type_keys('id=foo', '1,5 Bar');
+$sel->click('id=submit');
+$sel->wait_for_condition(sub {
+    URI->new($sel->view->get_uri)->query eq 'foo=1%2C5+Bar'
+});
+
+$sel->open("$Bin/test/delete.html");
+$sel->delete_text('id=foo');
+$sel->delete_text('id=bar');
+$sel->click('id=submit');
+$sel->wait_for_condition(sub {
+    URI->new($sel->view->get_uri)->query eq 'foo2=&bar2=&baz2=27+Baz'
+});
+
 $sel->open("$Bin/test/select.html");
 $sel->select('id=test', 'value=1');
 is(pop @{ $sel->alerts }, 'onchange fired');
@@ -98,7 +124,13 @@ $sel->select('id=test_event', 'value=1');
 is(pop @{ $sel->alerts }, 'change event fired');
 
 $sel->open("$Bin/test/utf8.html");
-is($sel->resolve_locator('xpath=//*[text() = "föö"]')->get_id, 'test');
+is($sel->resolve_locator('xpath=//*[text() = "föö"]')->Gtk3::WebKit::DOMElement::get_id, 'test');
 ok($sel->is_element_present('xpath=//*[text() = "föö"]'));
+
+$sel->disable_plugins;
+ok(1, 'disable_plugins worked');
+
+$sel->open("$Bin/test/load.html");
+ok(1, 'loaded test page without plugins');
 
 done_testing;
